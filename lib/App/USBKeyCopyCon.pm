@@ -9,7 +9,7 @@ App::USBKeyCopyCon - GUI console for bulk copying of USB keys
 
 =cut
 
-our $VERSION = '1.00';
+our $VERSION = '1.01';
 
 
 =head1 SYNOPSIS
@@ -17,7 +17,7 @@ our $VERSION = '1.00';
 To launch the GUI application that this module implements, simply run the
 supplied wrapper script:
 
-  sudo usb-key-copy-con
+  usb-key-copy-con
 
 =head1 DESCRIPTION
 
@@ -92,25 +92,28 @@ use File::Spec   qw();
 
 use Data::Dumper;
 
-has 'current_state'  => ( is => 'rw', isa => 'Str',  default => '' );
-has 'master_info'    => ( is => 'rw' );
-has 'temp_root'      => ( is => 'rw', isa => 'Str',  default => undef );
-has 'master_root'    => ( is => 'rw', isa => 'Str',  default => undef );
-has 'mount_dir'      => ( is => 'rw', isa => 'Str',  default => undef );
-has 'volume_label'   => ( is => 'rw', isa => 'Str',  default => '' );
-has 'reader_script'  => ( is => 'rw', isa => 'Str',  default => '' );
-has 'writer_script'  => ( is => 'rw', isa => 'Str',  default => '' );
-has 'selected_sound' => ( is => 'rw', isa => 'Str',  default => '' );
-has 'current_keys'   => ( is => 'ro', default => sub { {} } );
-has 'exit_status'    => ( is => 'ro', default => sub { {} } );
-has 'app_win'        => ( is => 'rw', isa => 'Gtk2::Window' );
-has 'key_rack'       => ( is => 'rw', isa => 'Gtk2::Container' );
-has 'console'        => ( is => 'rw', isa => 'Gtk2::TextView' );
-has 'vendor_combo'   => ( is => 'rw', isa => 'Gtk2::ComboBox' );
-has 'vendor_entry'   => ( is => 'rw', isa => 'Gtk2::Entry' );
-has 'capacity_combo' => ( is => 'rw', isa => 'Gtk2::ComboBox' );
-has 'capacity_entry' => ( is => 'rw', isa => 'Gtk2::Entry' );
-has 'hal'            => ( is => 'rw', isa => 'Net::DBus::RemoteObject' );
+has 'current_state'    => ( is => 'rw', isa => 'Str',  default => '' );
+has 'sudo_path'        => ( is => 'rw', isa => 'Str',  default => '' );
+has 'master_info'      => ( is => 'rw' );
+has 'options'          => ( is => 'rw', default => sub { {} } );
+has 'profiles'         => ( is => 'rw', default => sub { {} } );
+has 'selected_profile' => ( is => 'rw', isa => 'Str',  default => '' );
+has 'automount_state'  => ( is => 'rw', isa => 'Str',  default => undef );
+has 'temp_root'        => ( is => 'rw', isa => 'Str',  default => undef );
+has 'master_root'      => ( is => 'rw', isa => 'Str',  default => undef );
+has 'mount_dir'        => ( is => 'rw', isa => 'Str',  default => undef );
+has 'volume_label'     => ( is => 'rw', isa => 'Str',  default => '' );
+has 'selected_sound'   => ( is => 'rw', isa => 'Str',  default => '' );
+has 'current_keys'     => ( is => 'ro', default => sub { {} } );
+has 'exit_status'      => ( is => 'ro', default => sub { {} } );
+has 'app_win'          => ( is => 'rw', isa => 'Gtk2::Window' );
+has 'key_rack'         => ( is => 'rw', isa => 'Gtk2::Container' );
+has 'console'          => ( is => 'rw', isa => 'Gtk2::TextView' );
+has 'vendor_combo'     => ( is => 'rw', isa => 'Gtk2::ComboBox' );
+has 'vendor_entry'     => ( is => 'rw', isa => 'Gtk2::Entry' );
+has 'capacity_combo'   => ( is => 'rw', isa => 'Gtk2::ComboBox' );
+has 'capacity_entry'   => ( is => 'rw', isa => 'Gtk2::Entry' );
+has 'hal'              => ( is => 'rw', isa => 'Net::DBus::RemoteObject' );
 
 
 
@@ -150,6 +153,8 @@ my %hal_key_map = (
     'linux.sysfs_path'             => 'sysfs_path',
 );
 
+my $gconf_automount_path = '/apps/nautilus/preferences/media_automount';
+
 use constant VENDOR_EXACT      => 0;
 use constant VENDOR_PATTERN    => 1;
 use constant VENDOR_ANY        => 2;
@@ -161,11 +166,153 @@ use constant CAPACITY_ANY      => 2;
 sub BUILD {
     my $self = shift;
 
-    die "This program must be run as root\n" if $> != 0;
+    $self->check_for_root_user;
+    $self->set_temp_root('/tmp');
+    $self->scan_for_profiles;
+    $self->select_profile;
+    $self->disable_automount;
 
     my($path) = __FILE__ =~ m{^(.*)[.]pm$};
     $path = File::Spec->rel2abs($path) . "/copy-complete.wav";
     $self->selected_sound($path);
+
+    $self->build_ui;
+
+    $self->init_dbus_watcher;
+
+    $self->require_master_key;
+}
+
+
+sub sudo_wrap {
+    my($self, $command, @env_vars) = @_;
+
+    my $sudo = $self->sudo_path or return $command;
+
+    if($sudo =~ /gksudo/) {
+        my $msg = "The application 'usb-key-copy-con' requires administrative "
+                . "privileges to access USB flash drives";
+        return qq{$sudo --preserve-env --message "$msg" "$command"};
+    }
+
+    my $env = join '', map { qq($_="$ENV{$_}" ) } @env_vars;
+    return qq{$sudo $env $command}
+}
+
+
+sub find_command {
+    my($self, $command) = @_;
+
+    foreach my $dir (split /:/, $ENV{PATH}) {
+        my $path = "$dir/$command";
+        return $path if -x $path;
+    }
+    return;
+}
+
+
+sub commandline_options {
+    my $class = shift;
+    return(
+        'help|?',
+        '--no-root-check|n',
+        '--profile|p=s',
+        '--profile-dir|d=s'
+    );
+}
+
+
+sub scan_for_profiles {
+    my $self = shift;
+
+    my($path) = File::Spec->rel2abs(__FILE__) =~ m{^(.*)[.]pm$};
+    my @profile_dirs = ($path . "/profiles");
+
+    if(my $custom = $self->options->{'profile-dir'}) {
+        push @profile_dirs, File::Spec->rel2abs($custom);
+    }
+
+    my $result = {};
+    foreach my $dir (@profile_dirs) {
+        foreach my $script (glob("$dir/*")) {
+            my($profile, $mode) = $script =~ m{^.*/([^/]+)-(reader|writer)[.]\w+$}
+                or next;
+            $result->{$profile}->{$mode} = $script;
+        }
+    }
+    die "Unable to locate any profile scripts" if not keys %$result;
+
+    $self->profiles($result);
+}
+
+
+sub select_profile {
+    my($self, $profile) = @_;
+
+    $profile ||= $self->options->{profile} || 'copyfiles';
+    if(not $self->profiles->{$profile}) {
+        die "Invalid profile name: '$profile'\n"
+            . "Known profiles: "
+            . join(', ', keys %{$self->profiles})
+            . "\n";
+    }
+    $self->selected_profile($profile);
+    my($path) = __FILE__ =~ m{^(.*)[.]pm$};
+}
+
+sub reader_script {
+    my($self) = @_;
+    my $profile = $self->profiles->{$self->selected_profile} or return;
+    return $profile->{reader};
+}
+
+sub writer_script {
+    my($self) = @_;
+    my $profile = $self->profiles->{$self->selected_profile} or return;
+    return $profile->{writer};
+}
+
+
+sub check_for_root_user {
+    my $self = shift;
+
+    return if $self->options->{'no-root-check'};
+
+    return if $> == 0;
+
+    my $path = $self->find_command('gksudo') || $self->find_command('sudo');
+    if($path) {
+        $self->sudo_path($path);
+        return;
+    }
+
+    die "You must either run this program as root or install sudo\n";
+}
+
+
+sub disable_automount {
+    my $self = shift;
+
+    my $state = `gconftool-2 --get $gconf_automount_path 2>/dev/null`;
+    return if !defined($state) or $? != 0;
+
+    chomp($state);
+    $self->automount_state($state);
+    system("gconftool-2 --type bool --set $gconf_automount_path false 2>/dev/null");
+}
+
+
+sub restore_automount {
+    my $self = shift;
+
+    my $state = $self->automount_state or return;
+    system("gconftool-2 --type bool --set $gconf_automount_path $state 2>/dev/null");
+
+}
+
+
+sub build_ui {
+    my $self = shift;
 
     my $window = Gtk2::Window->new;
     $self->app_win($window);
@@ -182,10 +329,6 @@ sub BUILD {
     $window->add($vbox);
 
     $window->show_all;
-
-    $self->init_dbus_watcher;
-
-    $self->require_master_key;
 }
 
 
@@ -214,6 +357,9 @@ sub init_dbus_watcher {
 sub require_master_key {
     my $self = shift;
 
+    if(not $self->reader_script) {
+        return $self->ready_to_write;
+    }
     $self->current_state('MASTER-WAIT');
     $self->disable_filter_inputs;
     $self->say("Waiting for USB master key ...\n");
@@ -252,8 +398,7 @@ sub hal_device_removed {
     my $state = $self->current_state;
     if($state eq 'MASTER-COPIED') {
         if($self->master_info->{udi} eq $target_udi) {
-            $self->say("Insert blank keys - copying will start automatically\n");
-            $self->current_state('COPYING');
+            $self->ready_to_write;
         }
     }
     elsif($state eq 'COPYING') {
@@ -262,6 +407,15 @@ sub hal_device_removed {
         }
         $self->remove_key_from_rack($target_udi);
     }
+}
+
+
+sub ready_to_write {
+    my($self) = @_;
+
+    $self->say("Insert blank keys - copying will start automatically\n");
+    $self->enable_filter_inputs;
+    $self->current_state('COPYING');
 }
 
 
@@ -343,20 +497,26 @@ sub start_master_read {
     $self->capacity_combo->set_active(CAPACITY_EXACT);
     $self->capacity_entry->set_text($key_info->{media_size});
 
+    $self->say("Reading master key\n");
+
     pipe(my $rd, my $wr) or die "pipe(): $!";
     my $pid = fork();
     if($pid == 0) {  # In the child
         sleep(2);
-        my $temp_dir = '/home/grant/projects/lca-ukd/tmp';
         $ENV{USB_BLOCK_DEVICE} = $key_info->{block_device};
         $ENV{USB_MOUNT_DIR}    = $self->mount_dir . "/$key_info->{dev}";
         $ENV{USB_MASTER_ROOT}  = $self->master_root;
+        mkpath($ENV{USB_MOUNT_DIR}) if not -d $ENV{USB_MOUNT_DIR};
         close($rd);
         close STDOUT;
         open STDOUT, '>&', $wr or die "error reopening STDOUT: $!";
         close STDERR;
         open STDERR, '>&', $wr or die "error reopening STDERR: $!";
-        exec($self->reader_script) or die "Error starting copy script: $!";
+        my $command = $self->sudo_wrap(
+            $self->reader_script,
+            qw(USB_BLOCK_DEVICE USB_MOUNT_DIR USB_MASTER_ROOT),
+        );
+        exec($command) or die "Error starting reader script: $!";
         exit; # never reached;
     }
     close($wr);
@@ -420,7 +580,6 @@ sub fork_copier {
     my $pid = fork();
     if($pid == 0) {  # In the child
         sleep(2);
-        my $temp_dir = '/home/grant/projects/lca-ukd/tmp';
         $ENV{USB_BLOCK_DEVICE} = $key_info->{block_device};
         $ENV{USB_MOUNT_DIR}    = $self->mount_dir . "/$key_info->{dev}";
         $ENV{USB_MASTER_ROOT}  = $self->master_root;
@@ -431,7 +590,11 @@ sub fork_copier {
         open STDOUT, '>&', $wr or die "error reopening STDOUT: $!";
         close STDERR;
         open STDERR, '>&', $wr or die "error reopening STDERR: $!";
-        exec($self->writer_script) or die "Error starting copy script: $!";
+        my $command = $self->sudo_wrap(
+            $self->writer_script,
+            qw(USB_BLOCK_DEVICE USB_MOUNT_DIR USB_MASTER_ROOT USB_VOLUME_NAME),
+        );
+        exec($command) or die "Error starting copy script: $!";
         exit; # never reached;
     }
     close($wr);
@@ -444,6 +607,7 @@ sub fork_copier {
     $key_info->{pid}    = $pid;
     $key_info->{fh}     = $rd;
     $key_info->{output} = '';
+    $key_info->{status} = 0;
 }
 
 
@@ -650,6 +814,13 @@ sub build_console {
     $console->set_cursor_visible(FALSE);
     $console->set_wrap_mode('char');
 
+    my $end_mark = $buffer->create_mark( 'end', $buffer->get_end_iter, FALSE);
+    $buffer->signal_connect(
+        insert_text => sub {
+            $console->scroll_to_mark( $end_mark, 0.0, TRUE, 0.0, 0.0 );
+        }
+    );
+
     $self->console($console);
 
     $scrolled_window->add($console);
@@ -665,8 +836,6 @@ sub say {
     my $buffer = $console->get_buffer;
     my $end = $buffer->get_end_iter;
     $buffer->insert ($end, $msg);
-    $end = $buffer->get_end_iter;
-    $console->scroll_to_iter($end, 0, 0, 0, 0);
 }
 
 
@@ -738,18 +907,30 @@ sub confirm_master_dialog {
     $t_label->set_alignment(0, 0.5);
     $table->attach($t_label, 0, 1, $row, $row + 1, @pack_opts);
 
-    my $t_value = Gtk2::Label->new("/tmp");
-    $t_value->set_alignment(0, 0.5);
-    $table->attach($t_value, 1, 2, $row, $row + 1, @pack_opts);
-
     my $t_chooser = Gtk2::FileChooserButton->new(
         'Select a folder', 'select-folder'
     );
-    $t_chooser->set_filename('/tmp');
-    $t_chooser->signal_connect('file-set',
-        sub { $t_value->set_text( $t_chooser->get_filename ) }
-    );
-    $table->attach($t_chooser, 2, 3, $row, $row + 1, @pack_opts);
+    $t_chooser->set_filename('/tmp');  # TODO fixme!
+    $table->attach($t_chooser, 1, 2, $row, $row + 1, @pack_opts);
+    $row++;
+
+    my $p_label = Gtk2::Label->new;
+    $p_label->set_markup('<b>Copying Profile:</b>');
+    $p_label->set_alignment(0, 0.5);
+    $table->attach($p_label, 0, 1, $row, $row + 1, @pack_opts);
+
+    my $profile_combo = Gtk2::ComboBox->new_text;
+    my $profiles = $self->profiles;
+    my $selected = $self->selected_profile;
+    my @profile_names = sort  keys %$profiles;
+    my $i = 0;
+    foreach my $key (@profile_names) {
+        next unless $profiles->{$key}->{reader};
+        $profile_combo->append_text($key);
+        $profile_combo->set_active($i) if $key eq $selected;
+        $i++;
+    }
+    $table->attach($profile_combo, 1, 2, $row, $row + 1, @pack_opts);
     $row++;
 
     $table->show_all;
@@ -766,25 +947,9 @@ sub confirm_master_dialog {
 
     $self->set_temp_root($temp_root);
     $self->volume_label($volume_label);
-    $self->select_profile('copyfiles');
+    $self->select_profile($profile_names[$profile_combo->get_active]);
 
     return TRUE;
-}
-
-
-sub select_profile {
-    my($self, $profile) = @_;
-
-    my($path) = __FILE__ =~ m{^(.*)[.]pm$};
-    $path = File::Spec->rel2abs($path) . "/profiles";
-
-    my($reader) = glob("$path/$profile-reader*")
-        or die "Can't find reader script for profile '$profile' in $path";
-    $self->reader_script($reader);
-
-    my($writer) = glob("$path/$profile-writer*")
-        or die "Can't find writer script for profile '$profile' in $path";
-    $self->writer_script($writer);
 }
 
 
@@ -792,7 +957,8 @@ sub get_volume_label {
     my($self, $device) = @_;
 
     $device .= '1';  # examine first partition
-    my $label = `dosfslabel $device 2>/dev/null`;
+    my $command = $self->sudo_wrap("dosfslabel $device");
+    my $label = `$command 2>/dev/null`;
     chomp($label) if defined $label;
     return $label;
 }
@@ -875,6 +1041,8 @@ sub copy_finished {
 sub set_temp_root {
     my($self, $new_temp) = @_;
 
+    $self->clean_temp_dir;
+
     $self->temp_root($new_temp);
     my $temp_dir = "$new_temp/usb-copy.$$";
 
@@ -895,6 +1063,10 @@ sub clean_temp_dir {
 
     my $path = $self->master_root or return;
     $path =~ s{/master$}{};
+    if(-d $path and $self->sudo_path and $self->current_state ne 'MASTER-WAIT') {
+        my $command = $self->sudo_wrap("chown -R $< $path");
+        system($command);
+    }
     rmtree($path) if -d $path;
 }
 
@@ -915,6 +1087,7 @@ sub run {
 
     Gtk2->main;
 
+    $self->restore_automount;
     $self->clean_temp_dir;
 }
 
@@ -933,6 +1106,12 @@ accessor methods):
 =item app_win
 
 The main Gtk2::Window object.
+
+=item automount_state
+
+Stores the enabled state ('true' or 'false') of the GNOME/Nautilus media
+automount option.  The function will be disabled on startup and this value will
+be restored on exit.
 
 =item capacity_combo
 
@@ -990,14 +1169,31 @@ The path to the temp directory containing temporary mount points.
 
 The volume label read from the master key and to be applied to the copies.
 
-=item reader_script
+=item options
 
-The path to the profile script used to read the master key.
+A hash of option name/value pairs passed in from comman-line arguments by the
+wrapper script.
+
+=item profiles
+
+A hash of details of known profiles.  Used to populate the profile drop-down
+menu on the confirm master key dialog.
+
+=item selected_profile
+
+The name of the copying profile which will be used to select reader/writer
+scripts.
 
 =item selected_sound
 
 Pathname of the currently selected sound file, to be played when copying is
 complete.
+
+=item sudo_path
+
+If the script was run by a non-root user and sudo is available, this string
+will be populated with the pathname of either C<gksudo> or C<sudo>.  When
+running the read/writer scripts the string will be prepended onto the commands.
 
 =item temp_root
 
@@ -1014,36 +1210,72 @@ The Gtk2::Entry object for the device filter 'Vendor' text entry box.
 
 =item volume_label
 
-=item writer_script
-
-The path to the profile script used to write to the blank keys.
+The volume label which will be passed to the writer script.
 
 =back
 
 =head1 PROFILES
 
 The tasks of reading a master key and writing to a blank key are delegated to
-'reader' and 'writer' scripts.  A pair of reader/writer scripts is supplied
-but the application is designed to support using different scripts as
-dictated by a user selection.  The supplied script assume file-by-file copying
-and format the blank keys with a VFAT filesystem.  An alternate profile might
-use C<dd> to write a complete filesystem in a single operation.
+'reader' and 'writer' scripts.  A pair of reader/writer scripts is supplied but
+the application also supports using different scripts as dictated by a user
+selection.  The supplied scripts assume file-by-file copying and format the
+blank keys with a VFAT filesystem.  An alternate script might for example, use
+C<dd> to write a complete filesystem image in a single operation.
 
-A pair of scripts is referred to as a copying 'profile'.  The C<select_profile>
-method can be used to instruct the application to use a specific pair of
-scripts.
+A pair of scripts is referred to as a copying 'profile'.  The user can select a
+profile via a command-line option or from a drop-down list when confirming the
+master key.
 
 The supplied scripts are called:
 
   copyfiles-reader.sh
   copyfiles-writer.sh
 
-The default constructor selects this profile with the call:
+A profile does not need to include a reader script.  If a profile which only
+includes a writer script is selected (via the command-line options) then the
+application will go immediately into the mode of waiting for blank keys.
 
-  $self->select_profile('copyfiles');
+=head2 Profile Script API
+
+The filename of the reader script must end with C<-reader> (followed by an
+optional extension) and similarly, the filename of the writer script must end
+with C<-writer>.
 
 The reader/writer scripts do not have to be shell scripts - they merely need to
 be executable.  The application ignores the file extension if it is present.
+
+Both reader and writer scripts are assumed to have succeeded if they have an
+exit status of 0.  A non-zero exit status will be considered a failure.
+
+When the master key reader script is invoked, the following environment
+variables will be set:
+
+  USB_BLOCK_DEVICE    e.g.: /dev/sdb
+  USB_MOUNT_DIR       e.g.: /tmp/usb-copy.nnnnn/mount/sdb
+  USB_MASTER_ROOT     e.g.: /tmp/usb-copy.nnnnn/master
+
+The writer script will be passed the same set of variables and one extra:
+
+  USB_VOLUME_NAME     e.g.: FREE-STUFF
+
+Be warned that this variable may be empty - depending on what was returned from
+running C<dosfslabel> against the master key.  It is entirely reasonable for a
+custom writer script to ignore this variable altogether and either use a
+hardcoded volume label or not use one at all.
+
+The writer script can also indicate progress (for updating the progress bar in
+the icon) by writing lines to STDOUT in the following format:
+
+  {x/y}
+
+Where '{'  is the first character on a line; 'x' is an integer indicating the
+number of steps completed; and 'y' is an integer indicating the total number
+of steps. For example if the script output this line:
+
+  {4/8}
+
+the status icon would be updated to indicate 50% complete.
 
 =head1 METHODS
 
@@ -1064,29 +1296,52 @@ structure to track the copying process is created.
 
 =head2 build_console ( )
 
-Called from the constructor to create the scrolled text window for displaying
+Called from C<build_ui> to create the scrolled text window for displaying
 progress messages.
 
 =head2 build_filters ( )
 
-Called from the constructor to create the toolbar of drop-down menus and text
+Called from C<build_ui> to create the toolbar of drop-down menus and text
 entries for the device filter settings.
 
 =head2 build_key_rack ( )
 
-Called from the constructor to create the container widget to house the
+Called from C<build_ui> to create the container widget to house the
 per-key status indicators.
 
 =head2 build_menu ( )
 
-Called from the constructor to create the application menu and hook the menu
+Called from C<build_ui> to create the application menu and hook the menu
 items up to handler methods.
+
+=head2 build_ui ( )
+
+Called from the constructor to create the main application window and populate
+it with Gtk widgets.
+
+=head2 check_for_root_user ( )
+
+Called on startup to check that either the script is running as root or that sudo
+is available.  In the latter case, sudo (or gksudo) will be used to invoke the
+read/writer scripts.
+
+If the script is not running with root permissions; and sudo is not available;
+and the C<--no-root-check> option was not specified, this method will die with
+an appropriate error message.
 
 =head2 clean_temp_dir ( )
 
 Called from the C<run> method immediately before the application exits.  This
 method is responsible for removing the temporary directories containing the
 master copy of the files and the mount points for the blank keys.
+
+When running as a non-root user, this method needs to use sudo in order to
+remove the files created by the reader script when it was running as root.
+
+=head2 commandline_options ( )
+
+This B<class> method returns a list of recognised options in the form expected
+by L<Getopt::Long>.
 
 =head2 confirm_master_dialog ( key_info )
 
@@ -1107,6 +1362,13 @@ passed to the C<start_master_read> method.
 Called when a 'writer' process exits.  Checks the exit status and updates the
 icon in the key rack (0 = success, non-zero = failure).
 
+=head2 disable_automount ( )
+
+This method is called at startup to query GConf for the current GNOME/Nautilus
+media automount status ('true'/'false' for enabled/disabled).  The current
+state is saved and then the value is set to false.  The operation should fail
+silently in non-GNOME environments.
+
 =head2 disable_filter_inputs ( )
 
 This method is called from C<require_master_key> to disable the menu and text
@@ -1116,6 +1378,12 @@ entry widgets on the device filter toolbar.
 
 This method is called from C<require_master_key> to enable the menu and text
 entry widgets on the device filter toolbar.
+
+=head2 find_command ( command )
+
+Takes a command name and returns the path to the first matching executable file
+found in a directory listed in the $PATH environment variable.  Returns
+C<undef> if no match found.
 
 =head2 fork_copier ( key_info )
 
@@ -1195,6 +1463,18 @@ Handler for the Help E<gt> About menu item.  Displays 'About' dialog.
 This method takes a pathname to a sound file (e.g.: a .wav) and plays it.
 The current implementation simply runs the the SOX C<play> command - it should probably use GStreamer
 
+=head2 reader_script ( )
+
+Returns the path to the script from the currently selected profile, which will
+be used to read the master key.  Will return undef if the selected profile does
+not include a reader script.
+
+=head2 ready_to_write ( )
+
+This method is called after the master key has been read (or immediately on
+startup if the selected profile does not use a reader script) and puts the
+application into the mode of waiting for blank keys to be inserted.
+
 =head2 remove_key_from_rack ( udi )
 
 Called from C<hal_device_removed> to remove the indicator widget corresponding
@@ -1206,6 +1486,11 @@ Called from the constructor to put the app in the C<MASTER-WAIT> mode (waiting
 for the master key to be inserted).  Can also be called from the
 C<on_menu_file_new> menu event handler.
 
+=head2 restore_automount ( )
+
+This method is called at exit time restore the original GConf setting for the
+GNOME/Nautilus media automount function.
+
 =head2 run ( )
 
 This method is called from the wrapper script.  It's job is to run the Gtk
@@ -1215,6 +1500,10 @@ event loop and when that exits, to call C<clean_temp_dir> and then return.
 
 Appends a message to the console widget.  (Note, the caller is responsible
 for supplying the newline characters).
+
+=head2 scan_for_profiles ( )
+
+Populates the hash of profile data in the C<profiles> attribute.
 
 =head2 select_profile ( profile_name )
 
@@ -1233,6 +1522,17 @@ the user.
 Called from C<hal_device_added> to fork off a 'reader' process to slurp in the
 contents of the master key.
 
+=head2 sudo_wrap ( command env-var-names )
+
+If the script is run by a non-root user and sudo is available and the
+C<--no-root-check> option was not specified, this method will return a command
+string which wraps the supplied command in a call to either C<gksudo> or
+C<sudo>.  For all other cases, C<command> is returned unmodified.
+
+The C<gksudo> command is preferred since it gives the user a GUI prompt window
+if it is necessary to prompt for a password.  This method handles the different
+semantics required to pass environment variables through C<gksudo> and C<sudo>.
+
 =head2 tick ( )
 
 This timer event handler is used to take the child process exit status values
@@ -1246,6 +1546,11 @@ USB key device.  The progress parameter is a number in the range 0-10 for
 copies in progress; -1 for a copy that has failed (non-zero exit status from
 the 'writer' process); or -2 to indicate a device which did not match the
 filter settings and is being ignored.
+
+=head2 writer_script ( )
+
+Returns the path to the script from the currently selected profile, which will
+be used to write to the blank keys.
 
 =cut
 
