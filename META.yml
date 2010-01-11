@@ -1,6 +1,6 @@
 --- #YAML:1.0
 name:                App-USBKeyCopyCon
-version:             1.01
+version:             1.02
 abstract:            GUI console for bulk copying of USB keys
 license:             ~
 author:              
